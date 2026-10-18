@@ -109,10 +109,19 @@ sudo systemctl reload NetworkManager   # then reconnect Wi-Fi
 ## Upstream
 
 `upstream/0001-Bluetooth-btrtl-Add-support-for-the-RTL8852BD.patch` is the same
-change as a patch against mainline (`checkpatch.pl --strict` clean). It is an RFC:
-it can only be merged once Realtek publishes the firmware in `linux-firmware`.
-Recipients: linux-bluetooth@vger.kernel.org, Marcel Holtmann, Luiz Augusto von
-Dentz.
+change as an RFC patch against mainline. It applies to both v7.2.11 and the
+current `bluetooth-next` tree and is `checkpatch.pl --strict` clean. It can only
+be merged once Realtek publishes the eco 4 firmware in `linux-firmware`, which is
+why it is an RFC.
+
+Recipients (from `MAINTAINERS` and the Realtek authors of recent `btrtl` changes):
+
+```sh
+git send-email --to=linux-bluetooth@vger.kernel.org \
+	--cc=marcel@holtmann.org --cc=luiz.dentz@gmail.com \
+	--cc=max.chou@realtek.com --cc=hildawu@realtek.com \
+	upstream/0001-Bluetooth-btrtl-Add-support-for-the-RTL8852BD.patch
+```
 
 ## Credits
 

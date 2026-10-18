@@ -1,6 +1,6 @@
-From 8771edb473bfe02c1c1936edb38b96807b048d5b Mon Sep 17 00:00:00 2001
+From 29ccba4e6616d3c16b996afb04e721094a07f9da Mon Sep 17 00:00:00 2001
 From: Shuvam Banerji Seal <shuvambanerjiseal@gmail.com>
-Date: Sun, 18 Oct 2026 21:21:26 +0530
+Date: Sun, 18 Oct 2026 22:02:35 +0530
 Subject: [RFC PATCH] Bluetooth: btrtl: Add support for the RTL8852BD
 
 The RTL8852BD is a cut of the RTL8852B (USB ID 0bda:b853, lmp_subver
@@ -10,12 +10,12 @@ for chip id 3" (or -ENODATA with the v2 container) and the controller
 stays on ROM code with a non-functional radio.
 
 Realtek's Windows driver carries an "eco 4" patch for this cut as several
-records, each with its own RAM load address. Loading it takes one extra
-step compared to the existing download: before the fragments of a record
-are sent with 0xfc20, the record's load address is written with the
-vendor write-memory command 0xfc62 into 0x801200cc, the register holding
-the address that 0xfc20 fragments are stored at. Data fragments use
-plain indices; a final empty fragment with bit 7 set commits the patch.
+records, each with its own RAM load address. Before sending the 0xfc20
+fragments of a record, the Windows driver writes the record's load
+address into 0x801200cc with the vendor write-memory command 0xfc62;
+0x801200cc appears to hold the address that 0xfc20 fragments are stored
+at. Data fragments use plain indices, and a final empty fragment with
+bit 7 set commits the patch.
 
 Add this download path, used only when the regular parser finds no patch
 and the chip is identified as an RTL8852BD. The firmware is read from
@@ -24,13 +24,16 @@ rtl_bt/rtl8852bd_eco4.bin, a simple container of the records:
   "E4RD" | __le32 count | count * (__le32 load, __le32 len, data[len])
 
 Every command can succeed while the patch still fails to start, so read
-the local version back afterwards, as rtl_download_firmware() does, and
-retry up to three times (with an HCI reset in between) while the
-controller still reports the ROM lmp_subver.
+the local version back afterwards, as rtl_download_firmware() does. If
+the controller still reports the ROM lmp_subver, reset it and try again,
+making up to three attempts in total.
 
-Tested on a Lenovo laptop with an RTL8852BE combo card on v7.2.11: the
-patch starts on the first attempt (fw version 0x3c91950e), and inquiry,
-paging and A2DP streaming work.
+Tested on a Lenovo laptop with an RTL8852BE combo card, on v7.2.11
+(linux and linux-zen builds): the patch starts on the first attempt
+(fw version 0x3c91950e) after a reboot and across repeated module
+reloads, and inquiry, paging and A2DP streaming work. The retry path
+was exercised by skipping the commit on the first attempt: the ROM
+version was detected and the second attempt succeeded.
 
 This is sent as an RFC because rtl_bt/rtl8852bd_eco4.bin is not in
 linux-firmware; Realtek would have to publish it first.
@@ -40,6 +43,16 @@ The download sequence was originally worked out by mihaits.
 Link: https://github.com/mihaits/rtl8852bd-bt-linux
 Signed-off-by: Shuvam Banerji Seal <shuvambanerjiseal@gmail.com>
 ---
+I bought this laptop only to find that Bluetooth did not work at all on
+Linux. After weeks of fiddling around, this is the patch that makes it
+work. I am sending it as an RFC to ask how to get it into a mergeable
+state, and in the hope that Realtek can publish the eco 4 firmware in
+linux-firmware.
+
+An out-of-tree DKMS version of this change, with the firmware extractor,
+an Arch package and test notes, is at:
+https://github.com/Shuvam-Banerji-Seal/rtl8852bd-bt-dkms
+
  drivers/bluetooth/btrtl.c | 201 ++++++++++++++++++++++++++++++++++++++
  1 file changed, 201 insertions(+)
 
