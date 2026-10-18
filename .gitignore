@@ -1,0 +1,11 @@
+plans/
+arch/src/
+arch/pkg/
+arch/*.pkg.tar.*
+*.ko
+*.o
+*.mod*
+.*.cmd
+Module.symvers
+modules.order
+__pycache__/

@@ -1,0 +1,32 @@
+#!/bin/bash
+# Install the RTL8852BD eco4 Bluetooth patch from Realtek's Windows driver.
+#
+#   sudo rtl8852bd-bt-firmware <realtek-bluetooth-driver.exe | rtl8852bd_mp_chip_new.dat>
+#
+# The firmware is proprietary and cannot be redistributed, so it is extracted
+# from a driver package you download yourself.
+set -euo pipefail
+
+FW=/usr/lib/firmware/rtl_bt/rtl8852bd_eco4.bin
+EXTRACT=/usr/lib/rtl8852bd-bt/extract-firmware.py
+
+die() { echo "error: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ $# -eq 1 && -f $1 ]] || die "usage: rtl8852bd-bt-firmware <driver.exe | rtl8852bd_mp_chip_new.dat>"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+dat=$1
+if [[ $dat == *.exe ]]; then
+	command -v innoextract >/dev/null || die "innoextract is required for .exe input"
+	innoextract -s -d "$work/pkg" "$dat" >/dev/null || die "innoextract failed"
+	dat=$(find "$work/pkg" -iname rtl8852bd_mp_chip_new.dat -print -quit)
+	[[ -n $dat ]] || die "rtl8852bd_mp_chip_new.dat not found in $1"
+fi
+
+python3 -I "$EXTRACT" "$dat" -o "$work/rtl8852bd_eco4.bin"
+install -Dm644 "$work/rtl8852bd_eco4.bin" "$FW"
+echo "installed $FW"
+echo "reload with: sudo modprobe -r btusb btrtl && sudo modprobe btusb"

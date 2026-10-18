@@ -1,0 +1,18 @@
+post_install() {
+	if [ ! -e /usr/lib/firmware/rtl_bt/rtl8852bd_eco4.bin ]; then
+		echo ">>> The RTL8852BD patch firmware is not installed yet."
+		echo ">>> Download your laptop's Realtek Bluetooth driver (.exe) and run:"
+		echo ">>>   sudo rtl8852bd-bt-firmware /path/to/driver.exe"
+	fi
+	echo ">>> Reload the driver: sudo modprobe -r btusb btrtl && sudo modprobe btusb"
+	echo ">>> Bluetooth audio dropouts with Wi-Fi on? See /usr/share/rtl8852bd-bt/"
+}
+
+post_upgrade() {
+	post_install
+}
+
+post_remove() {
+	echo ">>> The in-kernel btrtl is back. The firmware file"
+	echo ">>> /usr/lib/firmware/rtl_bt/rtl8852bd_eco4.bin was left in place."
+}

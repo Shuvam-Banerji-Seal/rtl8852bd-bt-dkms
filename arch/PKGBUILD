@@ -1,0 +1,37 @@
+# Maintainer: Shuvam Banerji Seal <sbs22ms076@iiserkol.ac.in>
+
+pkgname=rtl8852bd-bt-dkms
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Bluetooth support for the Realtek RTL8852BD (0bda:b853, rom_version 3) via a patched btrtl module (DKMS)"
+arch=('any')
+url="https://github.com/Shuvam-Banerji-Seal/rtl8852bd-bt-dkms"
+license=('GPL-2.0-or-later')
+depends=('bash' 'dkms' 'python')
+optdepends=('innoextract: extract the firmware directly from the Windows driver .exe'
+            'linux-headers: build the module for the linux kernel'
+            'linux-zen-headers: build the module for the linux-zen kernel'
+            'linux-lts-headers: build the module for the linux-lts kernel')
+install=rtl8852bd-bt-dkms.install
+source=('btrtl.c' 'btrtl.h' 'Makefile' 'dkms.conf'
+        'extract-firmware.py' 'rtl8852bd-bt-firmware'
+        '90-rtl8852bd-wifi-powersave-off.conf')
+sha256sums=('f0a6c8ede8a9c064def81c66f9ae88762c9ab2e7b8d4628f420ca0c8f42397fc'
+            '452d4467259f1da92f0f71bb566499f1fa0e1c89ec4f5bf7412ba8c5489daaa1'
+            'd1e6dddfe7f2e1be0a982b42d8efa57c5af57b034faf7fa2aaea4ab25c38f580'
+            '088e04ce7938fc8e7aae71219bdce22e112e930ebba3e9ef0c8e545aa44edd52'
+            'eda71324584e9504611b15d6a3687f0a494330ca6d9d0427da0f71d136c9a8e7'
+            '58ea92ab9cdf8350190ea18d8ab9cd83d88d8f0022c3745c66332cbeb398115a'
+            '89a30093ecb095528828f0ae72d735c9b86423b924acc14bea0cd621ff5522f5')
+
+package() {
+	local dest="$pkgdir/usr/src/rtl8852bd-bt-$pkgver"
+
+	install -Dm644 btrtl.c btrtl.h Makefile -t "$dest"
+	sed "s/@PKGVER@/$pkgver/" dkms.conf > "$dest/dkms.conf"
+
+	install -Dm755 extract-firmware.py "$pkgdir/usr/lib/rtl8852bd-bt/extract-firmware.py"
+	install -Dm755 rtl8852bd-bt-firmware "$pkgdir/usr/bin/rtl8852bd-bt-firmware"
+	# opt-in fix for A2DP dropouts, see docs/a2dp-analysis.md
+	install -Dm644 90-rtl8852bd-wifi-powersave-off.conf -t "$pkgdir/usr/share/rtl8852bd-bt"
+}
