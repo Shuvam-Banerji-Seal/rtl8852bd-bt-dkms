@@ -81,9 +81,46 @@ Linux driver reports active profiles to the firmware with vendor command
 `0xfc19`; sending that report by hand was accepted (status 0) but did not
 change `bt_info` on this firmware, so it is not the fix here.
 
+## Second cause: Bluetooth reported as idle
+
+With power save off, audio was clean while Wi-Fi was quiet, but it still broke
+up when Wi-Fi downloaded heavily on 2.4 GHz. `btc_info` showed why: the Bluetooth
+firmware's status (`bt_info`) said `connect=1, acl_busy=0, a2dp=0` while
+streaming, so rtw89 ran its `BT_IDLE` policy and gave Wi-Fi most of the airtime
+(`avg_t[wl:39/bt:10]`).
+
+Realtek's vendor drivers tell the firmware which links carry which profiles with
+vendor command `0xfc19`
+(`u8 count, count × (le16 handle, u8 profile bits), u8 busy bits`; A2DP is bit 2).
+Sending `fc19 01 01 00 04 04` for the A2DP link made the firmware report
+`bt_info` `0x49` (connected, ACL busy, A2DP) and rtw89 switched to `BT_A2DP`.
+`tools/rtl8852bd-coexd` sends this automatically from BlueZ's transport state.
+
+A/B test, BSNL 2.4 GHz, 60 s per run, 4 parallel downloads saturating Wi-Fi:
+
+| coexd | Wi-Fi | audio packets | worst gap | gaps ≥ 100 ms | coex policy |
+|---|---|---|---|---|---|
+| on (r1) | 21 Mbit/s | 4503 | 93 ms | 0 | BT_A2DP |
+| off (r1) | 41 Mbit/s | 2157 | 156 ms | 27 | BT_IDLE |
+| on (r2) | 20 Mbit/s | 3315* | 103 ms | 1 | BT_A2DP |
+| off (r2) | 31 Mbit/s | 2146 | 153 ms | 36 | BT_IDLE |
+
+\* the user was seeking in a video during this run, which pauses the stream.
+
+The policy shares airtime fairly, so Wi-Fi throughput roughly halves while music
+plays; one shared antenna on one band cannot give both full rate. On 5 GHz the
+two do not share the band: 30 Mbit/s of downloads ran alongside full-rate audio
+(4500 packets, worst gap 73 ms).
+
 ## Fix
 
-Disable Wi-Fi power save. With NetworkManager:
+Disable Wi-Fi power save, and run `rtl8852bd-coexd`
+(`sudo systemctl enable --now rtl8852bd-coexd`). Prefer 5 GHz Wi-Fi where
+available.
+
+### Wi-Fi power save
+
+With NetworkManager:
 
 ```sh
 sudo install -Dm644 extras/90-rtl8852bd-wifi-powersave-off.conf \

@@ -1,0 +1,205 @@
+#!/usr/bin/python3 -I
+"""Report A2DP activity to the RTL8852BD Bluetooth firmware.
+
+On RTL8852BE combo cards Wi-Fi and Bluetooth share the 2.4 GHz antenna. The
+Wi-Fi driver (rtw89) schedules airtime from the status the Bluetooth firmware
+reports, and the firmware only reports an A2DP stream as busy after the host
+tells it with Realtek's vendor command 0xfc19 (what Realtek's own drivers do).
+Without that, rtw89 treats Bluetooth as idle and audio starves while Wi-Fi is
+busy on 2.4 GHz.
+
+This daemon watches BlueZ's A2DP transports and sends 0xfc19 whenever the set
+of A2DP links, or whether one of them is streaming, changes:
+
+    0xfc19: u8 count, count * (le16 handle, u8 profile_bitmap), u8 profile_status
+
+Only adapters with USB ID 0bda:b853 are touched.
+"""
+import fcntl
+import os
+import re
+import select
+import socket
+import struct
+import sys
+
+USB_ID = ("0bda", "b853")
+OP_SET_PROFILE_REPORT = 0xfc19
+PROFILE_A2DP = 1 << 2
+# A2DP Source/Sink UUIDs; the remote end of a transport is one of these
+A2DP_UUIDS = {"0000110a-0000-1000-8000-00805f9b34fb",
+              "0000110b-0000-1000-8000-00805f9b34fb"}
+REASSERT_SECS = 60
+
+SOL_HCI, HCI_FILTER = 0, 2
+EVT_CMD_COMPLETE, EVT_CMD_STATUS = 0x0e, 0x0f
+ACL_LINK = 1
+HCIGETCONNINFO = 0x800448d5          # _IOR('H', 213, int)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def build_report(links):
+    """links: {handle: busy}. Returns the 0xfc19 parameter bytes."""
+    out = bytearray([len(links)])
+    for handle in sorted(links):
+        out += struct.pack("<HB", handle, PROFILE_A2DP)
+    out.append(PROFILE_A2DP if any(links.values()) else 0)
+    return bytes(out)
+
+
+def parse_transport_path(path):
+    """'/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/sep1/fd0' -> (0, 'AA:BB:CC:DD:EE:FF')"""
+    m = re.match(r"^/org/bluez/hci(\d+)/dev_((?:[0-9A-F]{2}_){5}[0-9A-F]{2})/",
+                 path)
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2).replace("_", ":")
+
+
+def adapter_is_rtl8852bd(index):
+    dev = os.path.realpath(f"/sys/class/bluetooth/hci{index}/device")
+    try:
+        with open(os.path.join(dev, "..", "idVendor")) as v, \
+                open(os.path.join(dev, "..", "idProduct")) as p:
+            return (v.read().strip(), p.read().strip()) == USB_ID
+    except OSError:
+        return False
+
+
+def hci_socket(index):
+    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+    s.bind((index,))
+    return s
+
+
+def acl_handle(index, address):
+    """Connection handle of the ACL link to address on hci<index>, or None."""
+    bdaddr = bytes(int(b, 16) for b in reversed(address.split(":")))
+    req = bytearray(bdaddr + bytes([ACL_LINK, 0]) + bytes(16))
+    try:
+        with hci_socket(index) as s:
+            fcntl.ioctl(s.fileno(), HCIGETCONNINFO, req)
+    except OSError:
+        return None
+    return struct.unpack_from("<H", req, 8)[0]
+
+
+def send_command(index, opcode, params, timeout=2.0):
+    """Send an HCI command; return its status byte, or None on timeout."""
+    with hci_socket(index) as s:
+        s.setsockopt(SOL_HCI, HCI_FILTER, struct.pack(
+            "<IIIH", 1 << 4,
+            (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS), 0, 0) + b"\0\0")
+        s.send(struct.pack("<BHB", 1, opcode, len(params)) + params)
+        while True:
+            r, _, _ = select.select([s], [], [], timeout)
+            if not r:
+                return None
+            pkt = s.recv(260)
+            if pkt[1] == EVT_CMD_COMPLETE and \
+                    struct.unpack_from("<H", pkt, 4)[0] == opcode:
+                return pkt[6]
+            if pkt[1] == EVT_CMD_STATUS and \
+                    struct.unpack_from("<H", pkt, 5)[0] == opcode:
+                return pkt[3]
+
+
+class Coex:
+    def __init__(self, bus):
+        self.bus = bus
+        self.transports = {}     # path -> {"index", "address", "busy"}
+        self.sent = {}           # adapter index -> last report bytes
+
+    def update_transport(self, path, props):
+        uuid = str(props.get("UUID", "")).lower()
+        if uuid and uuid not in A2DP_UUIDS:
+            return
+        parsed = parse_transport_path(path)
+        if not parsed or not adapter_is_rtl8852bd(parsed[0]):
+            return
+        t = self.transports.setdefault(
+            path, {"index": parsed[0], "address": parsed[1], "busy": False})
+        if "State" in props:
+            t["busy"] = str(props["State"]) == "active"
+        self.sync(t["index"])
+
+    def remove_transport(self, path):
+        t = self.transports.pop(path, None)
+        if t:
+            self.sync(t["index"])
+
+    def sync(self, index, force=False):
+        links = {}
+        for t in self.transports.values():
+            if t["index"] != index:
+                continue
+            handle = acl_handle(index, t["address"])
+            if handle is not None:
+                links[handle] = links.get(handle, False) or t["busy"]
+        report = build_report(links)
+        if not force and self.sent.get(index) == report:
+            return
+        status = send_command(index, OP_SET_PROFILE_REPORT, report)
+        log(f"hci{index}: profile report {report.hex(' ')} -> "
+            f"{'timeout' if status is None else f'status 0x{status:02x}'}")
+        if status == 0:
+            self.sent[index] = report
+        else:
+            self.sent.pop(index, None)
+
+    def reassert(self):
+        for index in {t["index"] for t in self.transports.values() if t["busy"]}:
+            self.sync(index, force=True)
+        return True
+
+
+def main():
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    coex = Coex(bus)
+    transport_if = "org.bluez.MediaTransport1"
+
+    def on_props(iface, changed, _invalidated, path=None):
+        if iface == transport_if:
+            coex.update_transport(path, changed)
+
+    def on_added(path, ifaces):
+        if transport_if in ifaces:
+            coex.update_transport(str(path), ifaces[transport_if])
+
+    def on_removed(path, ifaces):
+        if transport_if in ifaces:
+            coex.remove_transport(str(path))
+
+    def on_bluez_owner(owner):
+        if not owner:                     # bluetoothd went away
+            for path in list(coex.transports):
+                coex.remove_transport(path)
+            return
+        om = dbus.Interface(bus.get_object("org.bluez", "/"),
+                            "org.freedesktop.DBus.ObjectManager")
+        for path, ifaces in om.GetManagedObjects().items():
+            on_added(path, ifaces)
+
+    bus.add_signal_receiver(on_props, "PropertiesChanged",
+                            "org.freedesktop.DBus.Properties", "org.bluez",
+                            path_keyword="path")
+    bus.add_signal_receiver(on_added, "InterfacesAdded",
+                            "org.freedesktop.DBus.ObjectManager", "org.bluez")
+    bus.add_signal_receiver(on_removed, "InterfacesRemoved",
+                            "org.freedesktop.DBus.ObjectManager", "org.bluez")
+    bus.watch_name_owner("org.bluez", on_bluez_owner)
+    GLib.timeout_add_seconds(REASSERT_SECS, coex.reassert)
+    log("rtl8852bd-coexd: watching BlueZ A2DP transports")
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

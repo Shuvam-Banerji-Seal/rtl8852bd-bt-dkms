@@ -2,7 +2,9 @@
 """Send one raw HCI command and print its Command Complete/Status event.
 
 usage: hcicmd.py <hex opcode> [hex param bytes...]   (needs CAP_NET_RAW)
+The adapter index comes from $HCI_DEV (default 0).
 """
+import os
 import select
 import socket
 import struct
@@ -15,7 +17,7 @@ opcode = int(sys.argv[1], 16)
 params = bytes(int(b, 16) for b in sys.argv[2:])
 
 s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-s.bind((0,))
+s.bind((int(os.environ.get("HCI_DEV", "0")),))
 # filter: event packets only, Command Complete + Command Status, any opcode
 type_mask = 1 << 4
 event_mask = (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS)

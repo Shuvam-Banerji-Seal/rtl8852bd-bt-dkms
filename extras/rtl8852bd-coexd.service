@@ -1,0 +1,28 @@
+[Unit]
+Description=Report A2DP activity to the RTL8852BD Bluetooth firmware (Wi-Fi/BT coexistence)
+Documentation=https://github.com/Shuvam-Banerji-Seal/rtl8852bd-bt-dkms
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+ExecStart=/usr/lib/rtl8852bd-bt/rtl8852bd-coexd
+Restart=on-failure
+RestartSec=5
+# raw HCI sockets need CAP_NET_RAW; nothing else
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_BLUETOOTH AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=bluetooth.target

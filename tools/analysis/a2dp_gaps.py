@@ -10,7 +10,7 @@ import statistics
 import sys
 
 GAP_MS = float(sys.argv[1]) if len(sys.argv) > 1 else 40.0
-hdr = re.compile(r'^([<>]) (.*?)\s+#\d+ \[hci0\] (?:[\d-]+ )?([\d:.]+)$')
+hdr = re.compile(r'^([<>]) (.*?)\s+#\d+ \[hci\d+\] (?:[\d-]+ )?([\d:.]+)$')
 
 
 def secs(t):
