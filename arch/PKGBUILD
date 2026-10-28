@@ -1,7 +1,7 @@
 # Maintainer: Shuvam Banerji Seal <sbs22ms076@iiserkol.ac.in>
 
 pkgname=rtl8852bd-bt-dkms
-pkgver=2.1.0
+pkgver=2.2.0
 pkgrel=1
 pkgdesc="Bluetooth support for the Realtek RTL8852BD (0bda:b853, rom_version 3) via a patched btrtl module (DKMS)"
 arch=('any')
@@ -24,8 +24,8 @@ sha256sums=('f0a6c8ede8a9c064def81c66f9ae88762c9ab2e7b8d4628f420ca0c8f42397fc'
             'eda71324584e9504611b15d6a3687f0a494330ca6d9d0427da0f71d136c9a8e7'
             '58ea92ab9cdf8350190ea18d8ab9cd83d88d8f0022c3745c66332cbeb398115a'
             '89a30093ecb095528828f0ae72d735c9b86423b924acc14bea0cd621ff5522f5'
-            '92ba041edfe36a883d566ead0a8268567183dd2db49342921ca822124007634a'
-            '21fcef34f3a51a66c1f8fc6e42c62c906a5742c8a5a1ff78b126c42eb4adffef')
+            '7b603baa4fbd3131828d10080c655189612cb32c061bad5a41a37edea2115a43'
+            '4284c035d71d74c6496774b94def408153578f0b3acf629dc9f0628f51c244d4')
 
 package() {
 	local dest="$pkgdir/usr/src/rtl8852bd-bt-$pkgver"
@@ -38,7 +38,7 @@ package() {
 	# opt-in fix for A2DP dropouts, see docs/a2dp-analysis.md
 	install -Dm644 90-rtl8852bd-wifi-powersave-off.conf -t "$pkgdir/usr/share/rtl8852bd-bt"
 
-	# A2DP activity reporting for Wi-Fi/Bluetooth coexistence
+	# A2DP and BLE input reporting for Wi-Fi/Bluetooth coexistence
 	install -Dm755 rtl8852bd-coexd -t "$pkgdir/usr/lib/rtl8852bd-bt"
 	install -Dm644 rtl8852bd-coexd.service -t "$pkgdir/usr/lib/systemd/system"
 }

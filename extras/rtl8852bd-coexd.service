@@ -1,5 +1,5 @@
 [Unit]
-Description=Report A2DP activity to the RTL8852BD Bluetooth firmware (Wi-Fi/BT coexistence)
+Description=Report A2DP and BLE input activity to the RTL8852BD Bluetooth firmware (Wi-Fi/BT coexistence)
 Documentation=https://github.com/Shuvam-Banerji-Seal/rtl8852bd-bt-dkms
 After=bluetooth.service
 Wants=bluetooth.service
@@ -8,9 +8,10 @@ Wants=bluetooth.service
 ExecStart=/usr/lib/rtl8852bd-bt/rtl8852bd-coexd
 Restart=on-failure
 RestartSec=5
-# raw HCI sockets need CAP_NET_RAW; nothing else
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+# raw HCI sockets (link events) need CAP_NET_RAW; MGMT_OP_HCI_CMD_SYNC, which
+# sends the vendor command in order with the kernel's own, needs CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

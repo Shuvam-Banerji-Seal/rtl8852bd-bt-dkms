@@ -1,17 +1,29 @@
 #!/usr/bin/python3 -I
-"""Report A2DP activity to the RTL8852BD Bluetooth firmware.
+"""Report Bluetooth link activity to the RTL8852BD Bluetooth firmware.
 
 On RTL8852BE combo cards Wi-Fi and Bluetooth share the 2.4 GHz antenna. The
 Wi-Fi driver (rtw89) schedules airtime from the status the Bluetooth firmware
-reports, and the firmware only reports an A2DP stream as busy after the host
-tells it with Realtek's vendor command 0xfc19 (what Realtek's own drivers do).
-Without that, rtw89 treats Bluetooth as idle and audio starves while Wi-Fi is
+reports, and the firmware only reports a link as busy after the host tells it
+with Realtek's vendor command 0xfc19 (what Realtek's own drivers do). Without
+that, rtw89 treats Bluetooth as idle and audio and input starve while Wi-Fi is
 busy on 2.4 GHz.
 
-This daemon watches BlueZ's A2DP transports and sends 0xfc19 whenever the set
-of A2DP links, or whether one of them is streaming, changes:
+This daemon sends 0xfc19 whenever the reported links, or which of their
+profiles are busy, change:
 
     0xfc19: u8 count, count * (le16 handle, u8 profile_bitmap), u8 profile_status
+
+- A2DP links come from BlueZ's media transports and are busy while streaming.
+- LE links are reported as HID, as Realtek's rtk_coex does ("for coex, le is
+  the same as hid"). A connection interval under 75 ms also sets the
+  HID-interval bit and marks HID busy. Intervals come from the controller's LE
+  connection events; for a link that predates the daemon, a device offering
+  the HID service is assumed to use a short interval.
+
+Commands go through the kernel's MGMT_OP_HCI_CMD_SYNC, which queues them with
+the kernel's own HCI commands. A vendor command sent on a raw HCI socket
+bypasses that queue and can complete while a kernel command is pending
+("unexpected event for opcode 0xfc19"); the raw socket is only a fallback.
 
 Only adapters with USB ID 0bda:b853 are touched.
 """
@@ -22,31 +34,53 @@ import select
 import socket
 import struct
 import sys
+import time
 
 USB_ID = ("0bda", "b853")
 OP_SET_PROFILE_REPORT = 0xfc19
+# profile bits, from Realtek's rtk_coex.h
+PROFILE_HID = 1 << 1
 PROFILE_A2DP = 1 << 2
+PROFILE_HID_INTERVAL = 1 << 4
 # A2DP Source/Sink UUIDs; the remote end of a transport is one of these
 A2DP_UUIDS = {"0000110a-0000-1000-8000-00805f9b34fb",
               "0000110b-0000-1000-8000-00805f9b34fb"}
+HID_SERVICE_UUID = "00001812-0000-1000-8000-00805f9b34fb"
+SHORT_INTERVAL = 60      # LE interval units of 1.25 ms, i.e. 75 ms (rtk_coex)
 REASSERT_SECS = 60
+SETTLE_MS = 500          # let the kernel finish handling a link change first
 
 SOL_HCI, HCI_FILTER = 0, 2
+HCI_EVENT_PKT = 0x04
+EVT_DISCONN_COMPLETE = 0x05
 EVT_CMD_COMPLETE, EVT_CMD_STATUS = 0x0e, 0x0f
-ACL_LINK = 1
-HCIGETCONNINFO = 0x800448d5          # _IOR('H', 213, int)
+EVT_LE_META = 0x3e
+# LE Meta subevent -> offset of Connection_Interval in its parameters
+LE_INTERVAL_OFFSET = {0x01: 12,     # LE Connection Complete
+                      0x03: 4,      # LE Connection Update Complete
+                      0x0a: 24,     # LE Enhanced Connection Complete
+                      0x29: 24}     # LE Enhanced Connection Complete [v2]
+ACL_LINK, LE_LINK = 0x01, 0x80
+HCIGETCONNLIST = 0x800448d4          # _IOR('H', 212, int)
+CONN_INFO = struct.Struct("<H6sBBHI")  # handle, bdaddr, type, out, state, mode
+MAX_CONN = 16
+
+HCI_DEV_NONE, HCI_CHANNEL_CONTROL = 0xffff, 3
+MGMT_OP_HCI_CMD_SYNC = 0x005b
+MGMT_EV_CMD_COMPLETE, MGMT_EV_CMD_STATUS = 0x0001, 0x0002
+MGMT_STATUS_UNKNOWN_COMMAND, MGMT_STATUS_PERMISSION_DENIED = 0x01, 0x14
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-def build_report(links):
-    """links: {handle: busy}. Returns the 0xfc19 parameter bytes."""
+def build_report(links, busy):
+    """links: {handle: profile_bitmap}. Returns the 0xfc19 parameter bytes."""
     out = bytearray([len(links)])
     for handle in sorted(links):
-        out += struct.pack("<HB", handle, PROFILE_A2DP)
-    out.append(PROFILE_A2DP if any(links.values()) else 0)
+        out += struct.pack("<HB", handle, links[handle])
+    out.append(busy)
     return bytes(out)
 
 
@@ -57,6 +91,44 @@ def parse_transport_path(path):
     if not m:
         return None
     return int(m.group(1)), m.group(2).replace("_", ":")
+
+
+def parse_adapter_path(path):
+    """'/org/bluez/hci0' -> 0"""
+    m = re.match(r"^/org/bluez/hci(\d+)$", path)
+    return int(m.group(1)) if m else None
+
+
+def parse_link_event(pkt):
+    """Raw HCI event -> ("le", handle, interval) for an LE connection or
+    parameter update, ("gone", handle, None) for a disconnection, else None."""
+    if len(pkt) < 3 or pkt[0] != HCI_EVENT_PKT:
+        return None
+    code, params = pkt[1], pkt[3:3 + pkt[2]]
+    if code == EVT_DISCONN_COMPLETE:
+        if len(params) < 3 or params[0]:
+            return None
+        return "gone", struct.unpack_from("<H", params, 1)[0] & 0x0fff, None
+    if code != EVT_LE_META or not params:
+        return None
+    offset = LE_INTERVAL_OFFSET.get(params[0])
+    if offset is None or len(params) < offset + 2 or params[1]:
+        return None
+    handle = struct.unpack_from("<H", params, 2)[0] & 0x0fff
+    return "le", handle, struct.unpack_from("<H", params, offset)[0]
+
+
+def parse_mgmt_reply(pkt, index):
+    """(mgmt status, return parameters) if pkt answers MGMT_OP_HCI_CMD_SYNC
+    on index, else None."""
+    if len(pkt) < 9:
+        return None
+    event, idx, plen = struct.unpack_from("<HHH", pkt)
+    opcode, status = struct.unpack_from("<HB", pkt, 6)
+    if event not in (MGMT_EV_CMD_COMPLETE, MGMT_EV_CMD_STATUS) or \
+            idx != index or opcode != MGMT_OP_HCI_CMD_SYNC:
+        return None
+    return status, bytes(pkt[9:6 + plen])
 
 
 def adapter_is_rtl8852bd(index):
@@ -75,23 +147,30 @@ def hci_socket(index):
     return s
 
 
-def acl_handle(index, address):
-    """Connection handle of the ACL link to address on hci<index>, or None."""
-    bdaddr = bytes(int(b, 16) for b in reversed(address.split(":")))
-    req = bytearray(bdaddr + bytes([ACL_LINK, 0]) + bytes(16))
+def conn_list(index):
+    """[(handle, address, link type)] of the connections on hci<index>."""
+    req = bytearray(struct.pack("<HH", index, MAX_CONN) +
+                    bytes(CONN_INFO.size * MAX_CONN))
     try:
         with hci_socket(index) as s:
-            fcntl.ioctl(s.fileno(), HCIGETCONNINFO, req)
+            fcntl.ioctl(s.fileno(), HCIGETCONNLIST, req)
     except OSError:
-        return None
-    return struct.unpack_from("<H", req, 8)[0]
+        return []
+    links = []
+    for i in range(struct.unpack_from("<H", req, 2)[0]):
+        handle, bdaddr, link_type, _, _, _ = CONN_INFO.unpack_from(
+            req, 4 + i * CONN_INFO.size)
+        address = ":".join(f"{b:02X}" for b in reversed(bdaddr))
+        links.append((handle, address, link_type))
+    return links
 
 
 def send_command(index, opcode, params, timeout=2.0):
-    """Send an HCI command; return its status byte, or None on timeout."""
+    """Send an HCI command on a raw socket; return its status byte, or None
+    on timeout."""
     with hci_socket(index) as s:
         s.setsockopt(SOL_HCI, HCI_FILTER, struct.pack(
-            "<IIIH", 1 << 4,
+            "<IIIH", 1 << HCI_EVENT_PKT,
             (1 << EVT_CMD_COMPLETE) | (1 << EVT_CMD_STATUS), 0, 0) + b"\0\0")
         s.send(struct.pack("<BHB", 1, opcode, len(params)) + params)
         while True:
@@ -107,10 +186,52 @@ def send_command(index, opcode, params, timeout=2.0):
                 return pkt[3]
 
 
+def mgmt_command(index, opcode, params, timeout=3.0):
+    """Run an HCI command through MGMT_OP_HCI_CMD_SYNC. Returns
+    (mgmt status, return parameters), or None on timeout."""
+    with socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
+                       socket.BTPROTO_HCI) as s:
+        s.bind((HCI_DEV_NONE, HCI_CHANNEL_CONTROL))
+        cp = struct.pack("<HBBH", opcode, 0, 0, len(params)) + params
+        s.send(struct.pack("<HHH", MGMT_OP_HCI_CMD_SYNC, index, len(cp)) + cp)
+        deadline = time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            r, _, _ = select.select([s], [], [], left)
+            if not r:
+                break
+            reply = parse_mgmt_reply(s.recv(512), index)
+            if reply is not None:
+                return reply
+    return None
+
+
+def send_report(index, params):
+    """Send 0xfc19 on hci<index>. Returns (HCI status or None, description)."""
+    reply = mgmt_command(index, OP_SET_PROFILE_REPORT, params)
+    if reply and reply[0] in (MGMT_STATUS_UNKNOWN_COMMAND,
+                              MGMT_STATUS_PERMISSION_DENIED):
+        # kernel without MGMT_OP_HCI_CMD_SYNC, or no CAP_NET_ADMIN
+        status, via = send_command(index, OP_SET_PROFILE_REPORT, params), \
+            " via raw socket"
+    elif reply is None:
+        return None, "timeout"
+    elif reply[0] or not reply[1]:
+        return None, f"mgmt status 0x{reply[0]:02x}"
+    else:
+        status, via = reply[1][0], ""
+    if status is None:
+        return None, "timeout" + via
+    return status, f"status 0x{status:02x}{via}"
+
+
 class Coex:
-    def __init__(self, bus):
+    def __init__(self, bus, glib):
         self.bus = bus
+        self.glib = glib
         self.transports = {}     # path -> {"index", "address", "busy"}
+        self.intervals = {}      # (index, handle) -> LE connection interval
+        self.watches = {}        # adapter index -> (socket, GLib source id)
+        self.pending = set()     # adapter indexes with a sync scheduled
         self.sent = {}           # adapter index -> last report bytes
 
     def update_transport(self, path, props):
@@ -124,35 +245,127 @@ class Coex:
             path, {"index": parsed[0], "address": parsed[1], "busy": False})
         if "State" in props:
             t["busy"] = str(props["State"]) == "active"
-        self.sync(t["index"])
+        self.schedule(t["index"])
 
     def remove_transport(self, path):
         t = self.transports.pop(path, None)
         if t:
-            self.sync(t["index"])
+            self.schedule(t["index"])
+
+    def watch_adapter(self, index):
+        """Follow LE connection and disconnection events on hci<index>."""
+        if index in self.watches or not adapter_is_rtl8852bd(index):
+            return
+        try:
+            s = hci_socket(index)
+            s.setsockopt(SOL_HCI, HCI_FILTER, struct.pack(
+                "<IIIH", 1 << HCI_EVENT_PKT, 1 << EVT_DISCONN_COMPLETE,
+                1 << (EVT_LE_META - 32), 0) + b"\0\0")
+        except OSError as e:
+            log(f"hci{index}: cannot watch link events: {e}")
+            return
+        source = self.glib.io_add_watch(
+            s.fileno(), self.glib.PRIORITY_DEFAULT,
+            self.glib.IO_IN | self.glib.IO_ERR | self.glib.IO_HUP,
+            self.on_hci_event, index)
+        self.watches[index] = (s, source)
+        self.schedule(index)
+
+    def unwatch_adapter(self, index, remove_source=True):
+        s, source = self.watches.pop(index, (None, None))
+        if s is None:
+            return
+        if remove_source:
+            self.glib.source_remove(source)
+        s.close()
+        for key in [k for k in self.intervals if k[0] == index]:
+            del self.intervals[key]
+        self.sent.pop(index, None)   # a re-registered controller starts afresh
+
+    def on_hci_event(self, _fd, condition, index):
+        try:
+            if condition & (self.glib.IO_ERR | self.glib.IO_HUP):
+                raise OSError("adapter went away")
+            pkt = self.watches[index][0].recv(260)
+        except OSError:
+            self.unwatch_adapter(index, remove_source=False)
+            return False
+        event = parse_link_event(pkt)
+        if event:
+            kind, handle, interval = event
+            if kind == "le":
+                if self.intervals.get((index, handle)) != interval:
+                    log(f"hci{index}: LE link 0x{handle:04x} interval "
+                        f"{interval * 1.25:g} ms")
+                self.intervals[(index, handle)] = interval
+            else:
+                self.intervals.pop((index, handle), None)
+            self.schedule(index)
+        return True
+
+    def schedule(self, index):
+        """Sync hci<index> once the kernel has handled the current change."""
+        if index in self.pending:
+            return
+        self.pending.add(index)
+
+        def run():
+            self.pending.discard(index)
+            self.sync(index)
+            return False
+        self.glib.timeout_add(SETTLE_MS, run)
+
+    def offers_hid(self, index, address):
+        from dbus.exceptions import DBusException
+
+        path = f"/org/bluez/hci{index}/dev_{address.replace(':', '_')}"
+        try:
+            uuids = self.bus.get_object("org.bluez", path).Get(
+                "org.bluez.Device1", "UUIDs",
+                dbus_interface="org.freedesktop.DBus.Properties")
+        except DBusException:
+            return False
+        return HID_SERVICE_UUID in (str(u).lower() for u in uuids)
+
+    def short_interval(self, index, handle, address):
+        interval = self.intervals.get((index, handle))
+        if interval is None:     # link predates the daemon
+            return self.offers_hid(index, address)
+        return interval < SHORT_INTERVAL
 
     def sync(self, index, force=False):
-        links = {}
+        links, busy = {}, 0
+        conns = conn_list(index)
+        acl = {addr: handle for handle, addr, kind in conns if kind == ACL_LINK}
         for t in self.transports.values():
-            if t["index"] != index:
-                continue
-            handle = acl_handle(index, t["address"])
+            handle = acl.get(t["address"]) if t["index"] == index else None
             if handle is not None:
-                links[handle] = links.get(handle, False) or t["busy"]
-        report = build_report(links)
-        if not force and self.sent.get(index) == report:
+                links[handle] = links.get(handle, 0) | PROFILE_A2DP
+                if t["busy"]:
+                    busy |= PROFILE_A2DP
+        for handle, address, kind in conns:
+            if kind != LE_LINK:
+                continue
+            links[handle] = links.get(handle, 0) | PROFILE_HID
+            if self.short_interval(index, handle, address):
+                links[handle] |= PROFILE_HID_INTERVAL
+                busy |= PROFILE_HID
+        report = build_report(links, busy)
+        unchanged = self.sent.get(index) == report
+        if unchanged and not force:
             return
-        status = send_command(index, OP_SET_PROFILE_REPORT, report)
-        log(f"hci{index}: profile report {report.hex(' ')} -> "
-            f"{'timeout' if status is None else f'status 0x{status:02x}'}")
+        status, result = send_report(index, report)
+        if not (unchanged and status == 0):     # keep reasserts out of the log
+            log(f"hci{index}: profile report {report.hex(' ')} -> {result}")
         if status == 0:
             self.sent[index] = report
         else:
             self.sent.pop(index, None)
 
     def reassert(self):
-        for index in {t["index"] for t in self.transports.values() if t["busy"]}:
-            self.sync(index, force=True)
+        for index, report in list(self.sent.items()):
+            if report[-1]:       # something is busy
+                self.sync(index, force=True)
         return True
 
 
@@ -163,20 +376,29 @@ def main():
 
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
-    coex = Coex(bus)
+    coex = Coex(bus, GLib)
     transport_if = "org.bluez.MediaTransport1"
+    adapter_if = "org.bluez.Adapter1"
 
     def on_props(iface, changed, _invalidated, path=None):
         if iface == transport_if:
             coex.update_transport(path, changed)
 
     def on_added(path, ifaces):
+        path = str(path)
         if transport_if in ifaces:
-            coex.update_transport(str(path), ifaces[transport_if])
+            coex.update_transport(path, ifaces[transport_if])
+        if adapter_if in ifaces and (index := parse_adapter_path(path)) \
+                is not None:
+            coex.watch_adapter(index)
 
     def on_removed(path, ifaces):
+        path = str(path)
         if transport_if in ifaces:
-            coex.remove_transport(str(path))
+            coex.remove_transport(path)
+        if adapter_if in ifaces and (index := parse_adapter_path(path)) \
+                is not None:
+            coex.unwatch_adapter(index)
 
     def on_bluez_owner(owner):
         if not owner:                     # bluetoothd went away
@@ -197,7 +419,7 @@ def main():
                             "org.freedesktop.DBus.ObjectManager", "org.bluez")
     bus.watch_name_owner("org.bluez", on_bluez_owner)
     GLib.timeout_add_seconds(REASSERT_SECS, coex.reassert)
-    log("rtl8852bd-coexd: watching BlueZ A2DP transports")
+    log("rtl8852bd-coexd: watching BlueZ A2DP transports and LE links")
     GLib.MainLoop().run()
 
 

@@ -112,6 +112,20 @@ plays; one shared antenna on one band cannot give both full rate. On 5 GHz the
 two do not share the band: 30 Mbit/s of downloads ran alongside full-rate audio
 (4500 packets, worst gap 73 ms).
 
+## BLE input devices
+
+The same report covers input devices. Realtek's `rtk_coex.h` defines the
+per-link bits (`sco 0, hid 1, a2dp 2, pan 3, hid_interval 4, hogp 5, voice 6,
+sink 7`), and `rtk_coex.c` reports every LE link as HID ("for coex, le is the
+same as hid"). A connection interval under 60 units (75 ms) adds `hid_interval`
+on the link and marks HID busy in the status byte; the `hogp` bit is never set.
+
+With a BLE keyboard (handle `0x0010`, interval 11.25 ms) and idle earbuds
+(handle `0x0001`), sending `fc19 02 01 00 04 10 00 12 02` changed `btc_info` from
+`profile:None` to `profile:HID`, and `bt_info` from `0x01` to `0x29` (connected,
+ACL busy, HID). `rtl8852bd-coexd` now sends this. Checked with Wi-Fi on 5 GHz;
+how much it helps input latency under 2.4 GHz load is not measured.
+
 ## Fix
 
 Disable Wi-Fi power save, and run `rtl8852bd-coexd`

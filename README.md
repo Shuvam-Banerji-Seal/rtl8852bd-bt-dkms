@@ -62,8 +62,8 @@ then resets it and retries up to three times before giving up with an error.
 ### Other distributions
 
 Untested, but it is the same steps the Arch package performs: copy `src/` to
-`/usr/src/rtl8852bd-bt-2.1.0/`, replace `@PKGVER@` in its `dkms.conf` with `2.1.0`,
-then `sudo dkms install rtl8852bd-bt/2.1.0`. Install the firmware with
+`/usr/src/rtl8852bd-bt-2.2.0/`, replace `@PKGVER@` in its `dkms.conf` with `2.2.0`,
+then `sudo dkms install rtl8852bd-bt/2.2.0`. Install the firmware with
 `tools/rtl8852bd-bt-firmware` (it expects the extractor at
 `/usr/lib/rtl8852bd-bt/extract-firmware.py`).
 
@@ -106,21 +106,36 @@ sudo install -Dm644 -t /etc/NetworkManager/conf.d/ \
 sudo systemctl reload NetworkManager   # then reconnect Wi-Fi
 ```
 
-### A2DP reporting service
+### Link reporting service (A2DP and BLE input)
 
-On 2.4 GHz the Wi-Fi driver only protects Bluetooth audio if the Bluetooth
-firmware reports that an A2DP stream is busy, and the firmware only does that after
-the host sends Realtek's vendor command `0xfc19`. Realtek's own drivers send it;
-mainline does not, so by default the Wi-Fi side treats Bluetooth as idle and audio
-starves whenever Wi-Fi is busy.
+On 2.4 GHz the Wi-Fi driver only protects Bluetooth traffic that the Bluetooth
+firmware reports as busy, and the firmware only does that after the host sends
+Realtek's vendor command `0xfc19`. Realtek's own drivers send it; mainline does not,
+so by default the Wi-Fi side treats Bluetooth as idle and audio and input starve
+whenever Wi-Fi is busy.
 
-`rtl8852bd-coexd` watches BlueZ and sends that report whenever an A2DP stream
-starts, stops or disconnects, only on `0bda:b853` adapters:
+`rtl8852bd-coexd` sends that report whenever the links change, only on
+`0bda:b853` adapters:
+
+- **A2DP**, from BlueZ's media transports: busy while a stream plays.
+- **BLE links** (keyboards, mice), reported as HID the way Realtek's `rtk_coex`
+  does. A connection interval under 75 ms, as input devices use, marks HID busy.
+  The interval comes from the controller's LE connection events.
 
 ```sh
 sudo systemctl enable --now rtl8852bd-coexd
 journalctl -u rtl8852bd-coexd   # "profile report 01 01 00 04 04 -> status 0x00" while playing
 ```
+
+The report goes through the kernel's `MGMT_OP_HCI_CMD_SYNC` (hence
+`CAP_NET_ADMIN`), which queues it with the kernel's own HCI commands. Sent on a
+raw HCI socket instead, it can complete while a kernel command is pending, which
+the kernel logs as `unexpected event for opcode 0xfc19`. The raw socket remains
+a fallback for kernels without that command.
+
+With a BLE keyboard connected, `btc_info` changes from `profile:None` to
+`profile:HID` (`bt_info` `0x01` to `0x29`). This was checked on 5 GHz; the
+effect on input latency under 2.4 GHz load has not been measured.
 
 Under a saturating download on 2.4 GHz it took audio from about 2150 to 4500
 packets per minute (0 gaps of 100 ms or more instead of 27-36), at the cost of
